@@ -923,17 +923,21 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       );
     }
 
+    const activeOrder = await ordersCollection.findOne({
+      deviceId,
+      status: "dispensing",
+    });
+
+    const isIdle = !activeOrder;
+
     const newOrder = {
       customerId: req.user.id,
       deviceId,
       items: orderItems,
       total,
-      // pending -> dispensing (a board claimed it) -> completed, or ->
-      // failed (timed out or the board explicitly gave up; see
-      // expireStaleOrders / the device-facing /fail route).
-      status: "pending",
+      status: isIdle ? "dispensing" : "pending",
       createdAt: new Date(),
-      dispensingStartedAt: null,
+      dispensingStartedAt: isIdle ? new Date() : null,
       completedAt: null,
       failedAt: null,
       failureReason: null,
@@ -941,17 +945,19 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     };
     const result = await ordersCollection.insertOne(newOrder);
 
-    // Publish dispense command to HiveMQ Cloud for instant push to ESP32
-    try {
-      const device = await devicesCollection.findOne({ _id: new ObjectId(deviceId) });
-      if (device?.qrToken) {
-        publishOrderDispense(device.qrToken, {
-          orderId: result.insertedId.toString(),
-          items: newOrder.items.map((i) => ({ slotNumber: i.slotNumber, qty: i.qty })),
-        });
+    // If machine is idle, trigger hardware immediately via HiveMQ
+    if (isIdle) {
+      try {
+        const device = await devicesCollection.findOne({ _id: new ObjectId(deviceId) });
+        if (device?.qrToken) {
+          await publishOrderDispense(device.qrToken, {
+            orderId: result.insertedId.toString(),
+            items: newOrder.items.map((i) => ({ slotNumber: i.slotNumber, qty: i.qty })),
+          });
+        }
+      } catch (mqttErr) {
+        console.error("[mqtt] Error publishing order trigger:", mqttErr);
       }
-    } catch (mqttErr) {
-      console.error("[mqtt] Error publishing order trigger:", mqttErr);
     }
 
     res.status(201).json({ _id: result.insertedId, ...newOrder });
