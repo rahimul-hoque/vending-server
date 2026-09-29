@@ -83,7 +83,14 @@ run().catch(console.dir);
 // jam, crash, power loss). Checked lazily on read (see expireStaleOrders)
 // rather than a background cron job, since Vercel serverless has nowhere
 // to run one.
-const STALE_ORDER_MS = 5 * 60 * 1000;
+//
+// Set above the firmware's own ORDER_MAX_DURATION_MS (60s) so the board's
+// own /fail report — which carries a specific reason — normally wins the
+// race; this is just the backstop for a board that can't report at all
+// (dead, powered off, network gone). Was 5 minutes — customers were
+// staring at "dispensing your order" for up to 5 minutes with nothing
+// telling them it had actually failed.
+const STALE_ORDER_MS = 90 * 1000;
 
 // Flips an order to "failed" and restores stock for whatever wasn't
 // dispensed yet. `stockRestored` makes this idempotent — safe to call on
