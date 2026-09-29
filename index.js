@@ -540,6 +540,13 @@ app.patch("/api/devices/by-token/:token/orders/:orderId/items/:slotNumber/progre
       return res.status(403).json({ error: "That order doesn't belong to this device" });
     }
 
+    // Same reasoning as the MQTT progress handler: a late report for an
+    // order the stale sweep already failed (and refunded stock for)
+    // would otherwise make it look both refunded and dispensed at once.
+    if (order.status === "completed" || order.status === "failed") {
+      return res.status(409).json({ error: `Order already ${order.status} — progress report ignored` });
+    }
+
     const slotNumber = Number(req.params.slotNumber);
     const itemIndex = order.items.findIndex((item) => item.slotNumber === slotNumber);
     if (itemIndex === -1) {
