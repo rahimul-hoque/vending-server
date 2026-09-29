@@ -105,6 +105,17 @@ async function failOrderInternal(order, reason) {
     { _id: order._id },
     { $set: { status: "failed", failedAt: new Date(), failureReason: reason, stockRestored: true } }
   );
+
+  // A failed order frees up the device, so pop the next queued order (if
+  // any). This is the one place shared by every failure path — the
+  // device-reported /fail route, the MQTT fail handler, and the lazy
+  // stale-order timeout sweep below — which matters because the sweep in
+  // particular had no other way to unstick a queue stuck behind a machine
+  // that went dark.
+  const device = await devicesCollection.findOne({ _id: new ObjectId(order.deviceId) });
+  if (device) {
+    await dispatchNextPendingOrder(device);
+  }
 }
 
 // Initialize HiveMQ Cloud MQTT connection and subscribers
@@ -604,9 +615,8 @@ app.patch("/api/devices/by-token/:token/orders/:orderId/fail", async (req, res) 
     }
 
     const reason = (req.body && req.body.reason) || "device_reported_failure";
+    // failOrderInternal dispatches the next queued order itself.
     await failOrderInternal(order, reason);
-    // Pop and trigger next queued order in line
-    await dispatchNextPendingOrder(device);
     res.json({ success: true });
   } catch (error) {
     console.error("Error failing order from device:", error);
@@ -887,40 +897,62 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     // Re-fetch every product server-side by (deviceId, slotNumber) — never
     // trust price/name/qty sent from the browser, and slotNumber is what
     // the physical machine actually needs to know what to dispense.
+    //
+    // Stock is checked and decremented in the SAME atomic findOneAndUpdate
+    // per item (the stock: {$gte: qty} guard lives in the filter, not a
+    // separate read beforehand) — two concurrent checkouts racing for the
+    // last unit can't both pass a plain read-then-decrement and oversell,
+    // because only one of them will ever match the filter for that final
+    // unit. If a later item in the same cart fails, everything this order
+    // already decremented gets rolled back below.
     const orderItems = [];
+    const decremented = [];
     let total = 0;
+    let validationError = null;
 
     for (const requested of items) {
       const slotNumber = Number(requested.slotNumber);
-      if (!Number.isInteger(slotNumber) || !requested.qty || requested.qty < 1) {
-        return res.status(400).json({ error: "Validation Error: each item needs a slotNumber and qty >= 1" });
+      const qty = Number(requested.qty);
+      if (!Number.isInteger(slotNumber) || !qty || qty < 1) {
+        validationError = { status: 400, message: "Validation Error: each item needs a slotNumber and qty >= 1" };
+        break;
       }
-      const product = await productsCollection.findOne({ deviceId, slotNumber });
-      if (!product) {
-        return res.status(400).json({ error: `No product found in slot ${slotNumber} on this device` });
+
+      const claimed = await productsCollection.findOneAndUpdate(
+        { deviceId, slotNumber, stock: { $gte: qty } },
+        { $inc: { stock: -qty } },
+        { returnDocument: "after" }
+      );
+
+      if (!claimed) {
+        const product = await productsCollection.findOne({ deviceId, slotNumber });
+        validationError = product
+          ? { status: 400, message: `Not enough stock for ${product.name} (only ${product.stock} left)` }
+          : { status: 400, message: `No product found in slot ${slotNumber} on this device` };
+        break;
       }
-      if (product.stock < requested.qty) {
-        return res.status(400).json({ error: `Not enough stock for ${product.name} (only ${product.stock} left)` });
-      }
-      const lineTotal = product.price * requested.qty;
-      total += lineTotal;
+
+      decremented.push({ slotNumber, qty });
+      total += claimed.price * qty;
       orderItems.push({
         slotNumber,
-        name: product.name, // locked in at time of purchase
-        price: product.price, // locked in at time of purchase
-        qty: requested.qty,
+        name: claimed.name, // locked in at time of purchase
+        price: claimed.price, // locked in at time of purchase
+        qty,
         dispensedQty: 0,
       });
     }
 
-    // Decrement stock for each item. Not wrapped in a Mongo transaction
-    // (would need a replica set) — acceptable for this project's scope,
-    // worth flagging as a known simplification for a real production system.
-    for (const item of orderItems) {
-      await productsCollection.updateOne(
-        { deviceId, slotNumber: item.slotNumber },
-        { $inc: { stock: -item.qty } }
-      );
+    if (validationError) {
+      // Give back whatever this same order already took before the item
+      // that failed, so a rejected cart doesn't leave stock short.
+      for (const item of decremented) {
+        await productsCollection.updateOne(
+          { deviceId, slotNumber: item.slotNumber },
+          { $inc: { stock: item.qty } }
+        );
+      }
+      return res.status(validationError.status).json({ error: validationError.message });
     }
 
     const activeOrder = await ordersCollection.findOne({
@@ -1034,8 +1066,8 @@ app.patch("/api/orders/:id/complete", requireAuth, requireRole(["owner", "admin"
     const order = await ordersCollection.findOne({ _id: new ObjectId(req.params.id) });
     if (!order) return res.status(404).json({ error: "Order not found" });
 
+    const device = await devicesCollection.findOne({ _id: new ObjectId(order.deviceId) });
     if (req.user.role !== "admin") {
-      const device = await devicesCollection.findOne({ _id: new ObjectId(order.deviceId) });
       if (!device || device.ownerId !== req.user.id) {
         return res.status(403).json({ error: "Not your order" });
       }
@@ -1057,6 +1089,12 @@ app.patch("/api/orders/:id/complete", requireAuth, requireRole(["owner", "admin"
       { _id: order._id },
       { $set: { ...dispensedFieldsSet, status: "completed", completedAt: new Date() } }
     );
+
+    // Same as the device/MQTT completion paths — free up the device for
+    // whatever's queued behind this order.
+    if (device) {
+      await dispatchNextPendingOrder(device);
+    }
     res.json({ success: true });
   } catch (error) {
     console.error("Error completing order:", error);
