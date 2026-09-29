@@ -503,16 +503,17 @@ app.get("/api/devices/by-token/:token/pending-orders", async (req, res) => {
 
     await expireStaleOrders({ deviceId: device._id.toString() });
 
-    const order = await ordersCollection.findOne(
+    // Atomic claim (findOneAndUpdate, not findOne+updateOne) — this route
+    // is now polled periodically even while MQTT looks healthy (a backup
+    // against a silently-failed publish), so it can run concurrently with
+    // dispatchNextPendingOrder firing from an MQTT event. Without this
+    // being atomic, both could grab the same pending order at once.
+    const order = await ordersCollection.findOneAndUpdate(
       { deviceId: device._id.toString(), status: "pending" },
-      { sort: { createdAt: 1 } }
+      { $set: { status: "dispensing", dispensingStartedAt: new Date() } },
+      { sort: { createdAt: 1 }, returnDocument: "after" }
     );
     if (!order) return res.json({});
-
-    await ordersCollection.updateOne(
-      { _id: order._id },
-      { $set: { status: "dispensing", dispensingStartedAt: new Date() } }
-    );
 
     res.json({
       orderId: order._id.toString(),
@@ -991,18 +992,37 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     };
     const result = await ordersCollection.insertOne(newOrder);
 
-    // If machine is idle, trigger hardware immediately via HiveMQ
+    // If machine is idle, trigger hardware immediately via HiveMQ. The
+    // order was already marked "dispensing" above — if this publish
+    // fails (or we can't even confirm it succeeded), that claim was a
+    // lie: nothing was actually sent, and the order would otherwise sit
+    // there "dispensing" with no way to recover except waiting out the
+    // full stale-order timeout. Revert it to "pending" so the board's
+    // own periodic backup poll (or the next order's completion, via
+    // dispatchNextPendingOrder) picks it up and retries — instead of
+    // silently stranding it.
     if (isIdle) {
+      let publishedOk = false;
       try {
         const device = await devicesCollection.findOne({ _id: new ObjectId(deviceId) });
         if (device?.qrToken) {
-          await publishOrderDispense(device.qrToken, {
+          publishedOk = await publishOrderDispense(device.qrToken, {
             orderId: result.insertedId.toString(),
             items: newOrder.items.map((i) => ({ slotNumber: i.slotNumber, qty: i.qty })),
           });
         }
       } catch (mqttErr) {
         console.error("[mqtt] Error publishing order trigger:", mqttErr);
+      }
+
+      if (!publishedOk) {
+        console.warn(`[mqtt] Publish failed or unconfirmed for order ${result.insertedId} — reverting to pending for retry`);
+        await ordersCollection.updateOne(
+          { _id: result.insertedId },
+          { $set: { status: "pending", dispensingStartedAt: null } }
+        );
+        newOrder.status = "pending";
+        newOrder.dispensingStartedAt = null;
       }
     }
 
