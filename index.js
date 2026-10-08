@@ -925,6 +925,12 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     if (!device) {
       return res.status(400).json({ error: "Validation Error: device not found" });
     }
+    if (device.status !== "active") {
+      return res.status(403).json({
+        error: "This machine is currently inactive and isn't accepting orders.",
+        code: "DEVICE_INACTIVE",
+      });
+    }
 
     // Re-fetch every product server-side by (deviceId, slotNumber) — never
     // trust price/name/qty sent from the browser, and slotNumber is what
