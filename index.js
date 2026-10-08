@@ -40,9 +40,19 @@ async function run() {
   }
 }
 async function requireAuth(req, res, next) {
-  const result = await auth.api.getSession({
-    headers: fromNodeHeaders(req.headers),
-  });
+  let result;
+  try {
+    result = await auth.api.getSession({
+      headers: fromNodeHeaders(req.headers),
+    });
+  } catch (error) {
+    // A session lookup that *throws* (almost always a MongoDB hiccup) is
+    // not the same as "not logged in" — answer with a JSON 503 instead of
+    // an unhandled crash, so the client can show a retryable error and the
+    // real cause lands in the logs.
+    console.error("Session lookup failed:", error);
+    return res.status(503).json({ error: "Auth service temporarily unavailable" });
+  }
   if (!result) {
     return res.status(401).json({ error: "Unauthorized" });
   }
