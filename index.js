@@ -92,6 +92,15 @@ run().catch(console.dir);
 // telling them it had actually failed.
 const STALE_ORDER_MS = 90 * 1000;
 
+// Board polls every 5s; heartbeat writes are throttled to HEARTBEAT_WRITE_MS,
+// so "online" must tolerate that gap plus a few missed polls.
+const HEARTBEAT_WRITE_MS = 15 * 1000;
+const ONLINE_WINDOW_MS = 45 * 1000;
+const withOnline = (device) => ({
+  ...device,
+  online: !!device.lastSeen && Date.now() - new Date(device.lastSeen).getTime() < ONLINE_WINDOW_MS,
+});
+
 // Flips an order to "failed" and restores stock for whatever wasn't
 // dispensed yet. `stockRestored` makes this idempotent — safe to call on
 // the same order twice (e.g. the lazy sweep and an explicit /fail call
@@ -336,7 +345,7 @@ app.get("/api/devices", requireAuth, requireRole(["owner", "admin"]), async (req
   try {
     const filter = req.user.role === "admin" ? {} : { ownerId: req.user.id };
     const devices = await devicesCollection.find(filter).toArray();
-    res.json(devices);
+    res.json(devices.map(withOnline));
   } catch (error) {
     console.error("Error listing devices:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -500,6 +509,14 @@ app.get("/api/devices/by-token/:token/pending-orders", async (req, res) => {
   try {
     const device = await devicesCollection.findOne({ qrToken: req.params.token });
     if (!device) return res.status(404).json({ error: "Device not found" });
+
+    // This poll doubles as the board's heartbeat. It's the one signal that
+    // works reliably on Vercel (the MQTT subscriber there freezes between
+    // invocations), so lastSeen is stamped here — throttled, to avoid a
+    // database write on every 5s poll.
+    if (!device.lastSeen || Date.now() - new Date(device.lastSeen).getTime() > HEARTBEAT_WRITE_MS) {
+      await devicesCollection.updateOne({ _id: device._id }, { $set: { lastSeen: new Date() } });
+    }
 
     await expireStaleOrders({ deviceId: device._id.toString() });
 
