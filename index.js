@@ -104,11 +104,12 @@ const STALE_ORDER_MS = 90 * 1000;
 
 // Board polls every 5s and each poll stamps lastSeen (HEARTBEAT_WRITE_MS
 // only stops back-to-back duplicate polls from writing twice). Offline =
-// no poll for ONLINE_WINDOW_MS: about two missed polls plus slack for a
-// slow serverless request. The board stops polling while it dispenses, so
-// a device with an active order counts as online too.
+// no poll for ONLINE_WINDOW_MS: about three missed polls, so one slow poll
+// or a brief MQTT reconnect on the board can't flash it offline. The board
+// stops polling while it dispenses, so a device with an active order
+// counts as online too.
 const HEARTBEAT_WRITE_MS = 4 * 1000;
-const ONLINE_WINDOW_MS = 15 * 1000;
+const ONLINE_WINDOW_MS = 20 * 1000;
 const withOnline = (device, dispensingIds = new Set()) => ({
   ...device,
   online:
