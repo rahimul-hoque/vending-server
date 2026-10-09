@@ -116,6 +116,32 @@ const withOnline = (device, dispensingIds = new Set()) => ({
     (!!device.lastSeen && Date.now() - new Date(device.lastSeen).getTime() < ONLINE_WINDOW_MS),
 });
 
+// Single-device version of withOnline, for order placement and the shop's
+// availability check.
+async function isDeviceOnline(device) {
+  if (device.lastSeen && Date.now() - new Date(device.lastSeen).getTime() < ONLINE_WINDOW_MS) return true;
+  const active = await ordersCollection.findOne(
+    {
+      deviceId: device._id.toString(),
+      status: "dispensing",
+      dispensingStartedAt: { $gte: new Date(Date.now() - STALE_ORDER_MS) },
+    },
+    { projection: { _id: 1 } }
+  );
+  return !!active;
+}
+
+// Why a device can't take orders right now, or null if it can.
+async function deviceUnavailableReason(device) {
+  if (device.status !== "active") {
+    return { code: "DEVICE_INACTIVE", error: "This machine is currently inactive and isn't accepting orders." };
+  }
+  if (!(await isDeviceOnline(device))) {
+    return { code: "DEVICE_OFFLINE", error: "This machine is offline right now. Please try again in a moment." };
+  }
+  return null;
+}
+
 // Flips an order to "failed" and restores stock for whatever wasn't
 // dispensed yet. `stockRestored` makes this idempotent — safe to call on
 // the same order twice (e.g. the lazy sweep and an explicit /fail call
@@ -388,6 +414,27 @@ app.get("/api/devices/by-token/:token", async (req, res) => {
     res.json(device);
   } catch (error) {
     console.error("Error resolving device token:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Whether a customer can order from this machine right now. Polled by the
+// shop's browse/cart/checkout pages to disable ordering with a reason.
+app.get("/api/devices/:id/availability", requireAuth, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "Device not found" });
+    const device = await devicesCollection.findOne({ _id: new ObjectId(req.params.id) });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+    const [unavailable, online] = await Promise.all([deviceUnavailableReason(device), isDeviceOnline(device)]);
+    res.json({
+      available: !unavailable,
+      status: device.status,
+      online,
+      code: unavailable?.code || null,
+      message: unavailable?.error || null,
+    });
+  } catch (error) {
+    console.error("Error checking device availability:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1012,12 +1059,10 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     if (!device) {
       return res.status(400).json({ error: "Validation Error: device not found" });
     }
-    if (device.status !== "active") {
-      return res.status(403).json({
-        error: "This machine is currently inactive and isn't accepting orders.",
-        code: "DEVICE_INACTIVE",
-      });
-    }
+    // Inactive or offline machines can't take orders: an offline one would
+    // just queue the order until the stale sweep fails it 90s later.
+    const unavailable = await deviceUnavailableReason(device);
+    if (unavailable) return res.status(409).json(unavailable);
 
     // Re-fetch every product server-side by (deviceId, slotNumber) — never
     // trust price/name/qty sent from the browser, and slotNumber is what
