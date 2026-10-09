@@ -1156,6 +1156,73 @@ app.get("/api/orders/mine", requireAuth, async (req, res) => {
   }
 });
 
+// Dashboard numbers computed in the database instead of shipping every
+// order to the browser. Failed orders had their stock refunded, so they
+// don't count towards revenue or top sellers. ?tz (IANA name) sets which
+// calendar day an order falls on.
+app.get("/api/orders/stats", requireAuth, requireRole(["owner", "admin"]), async (req, res) => {
+  try {
+    const scope = await orderScopeFilter(req.user);
+    await expireStaleOrders(scope);
+
+    let timezone = "UTC";
+    try {
+      if (req.query.tz) {
+        new Intl.DateTimeFormat("en", { timeZone: req.query.tz });
+        timezone = req.query.tz;
+      }
+    } catch {} // unknown zone name: fall back to UTC
+
+    const [result] = await ordersCollection
+      .aggregate([
+        { $match: scope },
+        {
+          $facet: {
+            byStatus: [{ $group: { _id: "$status", count: { $sum: 1 } } }],
+            revenue: [
+              { $match: { status: { $ne: "failed" } } },
+              { $group: { _id: null, total: { $sum: "$total" } } },
+            ],
+            revenueByDay: [
+              { $match: { status: { $ne: "failed" } } },
+              {
+                $group: {
+                  _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone } },
+                  revenue: { $sum: "$total" },
+                },
+              },
+              { $sort: { _id: 1 } },
+              { $project: { _id: 0, day: "$_id", revenue: 1 } },
+            ],
+            topSelling: [
+              { $match: { status: { $ne: "failed" } } },
+              { $unwind: "$items" },
+              { $group: { _id: "$items.name", qty: { $sum: "$items.qty" } } },
+              { $sort: { qty: -1 } },
+              { $limit: 8 },
+              { $project: { _id: 0, name: "$_id", qty: 1 } },
+            ],
+          },
+        },
+      ])
+      .toArray();
+
+    const counts = { pending: 0, dispensing: 0, completed: 0, failed: 0 };
+    for (const { _id, count } of result.byStatus) if (_id in counts) counts[_id] = count;
+
+    res.json({
+      totalRevenue: result.revenue[0]?.total || 0,
+      orderCount: counts.pending + counts.dispensing + counts.completed + counts.failed,
+      counts,
+      revenueByDay: result.revenueByDay,
+      topSelling: result.topSelling,
+    });
+  } catch (error) {
+    console.error("Error computing order stats:", error);
+    res.status(500).json({ error: "Internal server error" });
+// (/api/orders/stats and /mine must stay above this route, or Express
+// matches "stats"/"mine" as an order id.)
+
 // Single order, scoped to whoever's allowed to see it — the customer who
 // placed it, the owner of the device it's on, or admin. Meant to be
 // polled by the checkout confirmation screen so the customer can watch
@@ -1222,70 +1289,6 @@ app.get("/api/orders", requireAuth, requireRole(["owner", "admin"]), async (req,
   }
 });
 
-// Dashboard numbers computed in the database instead of shipping every
-// order to the browser. Failed orders had their stock refunded, so they
-// don't count towards revenue or top sellers. ?tz (IANA name) sets which
-// calendar day an order falls on.
-app.get("/api/orders/stats", requireAuth, requireRole(["owner", "admin"]), async (req, res) => {
-  try {
-    const scope = await orderScopeFilter(req.user);
-    await expireStaleOrders(scope);
-
-    let timezone = "UTC";
-    try {
-      if (req.query.tz) {
-        new Intl.DateTimeFormat("en", { timeZone: req.query.tz });
-        timezone = req.query.tz;
-      }
-    } catch {} // unknown zone name: fall back to UTC
-
-    const [result] = await ordersCollection
-      .aggregate([
-        { $match: scope },
-        {
-          $facet: {
-            byStatus: [{ $group: { _id: "$status", count: { $sum: 1 } } }],
-            revenue: [
-              { $match: { status: { $ne: "failed" } } },
-              { $group: { _id: null, total: { $sum: "$total" } } },
-            ],
-            revenueByDay: [
-              { $match: { status: { $ne: "failed" } } },
-              {
-                $group: {
-                  _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone } },
-                  revenue: { $sum: "$total" },
-                },
-              },
-              { $sort: { _id: 1 } },
-              { $project: { _id: 0, day: "$_id", revenue: 1 } },
-            ],
-            topSelling: [
-              { $match: { status: { $ne: "failed" } } },
-              { $unwind: "$items" },
-              { $group: { _id: "$items.name", qty: { $sum: "$items.qty" } } },
-              { $sort: { qty: -1 } },
-              { $limit: 8 },
-              { $project: { _id: 0, name: "$_id", qty: 1 } },
-            ],
-          },
-        },
-      ])
-      .toArray();
-
-    const counts = { pending: 0, dispensing: 0, completed: 0, failed: 0 };
-    for (const { _id, count } of result.byStatus) if (_id in counts) counts[_id] = count;
-
-    res.json({
-      totalRevenue: result.revenue[0]?.total || 0,
-      orderCount: counts.pending + counts.dispensing + counts.completed + counts.failed,
-      counts,
-      revenueByDay: result.revenueByDay,
-      topSelling: result.topSelling,
-    });
-  } catch (error) {
-    console.error("Error computing order stats:", error);
-    res.status(500).json({ error: "Internal server error" });
   }
 });
 
