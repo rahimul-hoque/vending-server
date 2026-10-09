@@ -6,7 +6,7 @@ import { ObjectId } from "mongodb";
 import { fromNodeHeaders } from "better-auth/node";
 import { client, db } from "./lib/db.js";
 import { auth } from "./lib/auth.js";
-import { initMqtt, publishOrderDispense, dispatchNextPendingOrder } from "./lib/mqtt.js";
+import { initMqtt, publishWake, dispatchNextPendingOrder } from "./lib/mqtt.js";
 
 dotenv.config();
 const app = express();
@@ -682,8 +682,8 @@ app.patch("/api/devices/by-token/:token/orders/:orderId/complete", async (req, r
     if (order.status === "completed") {
       return res.json({ success: true }); // already done — treat as success, not an error
     }
-    if (order.status === "failed") {
-      return res.status(400).json({ error: "This order already timed out and had its stock restored." });
+    if (order.status === "failed" && order.failureReason !== "timeout") {
+      return res.status(400).json({ error: "This order was already marked failed." });
     }
 
     const fullyDispensedItems = order.items.map((item, i) => ({
@@ -691,10 +691,30 @@ app.patch("/api/devices/by-token/:token/orders/:orderId/complete", async (req, r
     }));
     const dispensedFieldsSet = Object.assign({}, ...fullyDispensedItems);
 
-    await ordersCollection.updateOne(
-      { _id: order._id },
-      { $set: { ...dispensedFieldsSet, status: "completed", completedAt: new Date() } }
+    // The board says it really dispensed this order, but the server had
+    // already timed it out (report delayed by a slow network) and refunded
+    // its undispensed stock. Take that stock back and record the truth, so
+    // the customer isn't told their order failed after getting the item.
+    const lateAfterTimeout = order.status === "failed";
+    const claimed = await ordersCollection.updateOne(
+      { _id: order._id, status: order.status },
+      {
+        $set: { ...dispensedFieldsSet, status: "completed", completedAt: new Date(), stockRestored: false },
+        ...(lateAfterTimeout ? { $unset: { failedAt: "", failureReason: "" } } : {}),
+      }
     );
+    if (claimed.modifiedCount === 1 && lateAfterTimeout && order.stockRestored) {
+      for (const item of order.items) {
+        const refunded = item.qty - (item.dispensedQty || 0);
+        if (refunded > 0) {
+          await productsCollection.updateOne(
+            { deviceId: order.deviceId, slotNumber: item.slotNumber },
+            { $inc: { stock: -refunded } }
+          );
+        }
+      }
+      console.log(`[order] ${order._id} completed late after timeout — refunded stock taken back`);
+    }
     res.json({ success: true });
   } catch (error) {
     console.error("Error completing order from device:", error);
@@ -1126,21 +1146,17 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       return res.status(validationError.status).json({ error: validationError.message });
     }
 
-    const activeOrder = await ordersCollection.findOne({
-      deviceId,
-      status: "dispensing",
-    });
-
-    const isIdle = !activeOrder;
-
+    // Every order starts "pending"; the board claims it (-> "dispensing")
+    // through its own poll, so the status always reflects what the
+    // machine actually has. The wake-up below just makes that immediate.
     const newOrder = {
       customerId: req.user.id,
       deviceId,
       items: orderItems,
       total,
-      status: isIdle ? "dispensing" : "pending",
+      status: "pending",
       createdAt: new Date(),
-      dispensingStartedAt: isIdle ? new Date() : null,
+      dispensingStartedAt: null,
       completedAt: null,
       failedAt: null,
       failureReason: null,
@@ -1148,38 +1164,10 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     };
     const result = await ordersCollection.insertOne(newOrder);
 
-    // If machine is idle, trigger hardware immediately via HiveMQ. The
-    // order was already marked "dispensing" above — if this publish
-    // fails (or we can't even confirm it succeeded), that claim was a
-    // lie: nothing was actually sent, and the order would otherwise sit
-    // there "dispensing" with no way to recover except waiting out the
-    // full stale-order timeout. Revert it to "pending" so the board's
-    // own periodic backup poll (or the next order's completion, via
-    // dispatchNextPendingOrder) picks it up and retries — instead of
-    // silently stranding it.
-    if (isIdle) {
-      let publishedOk = false;
-      try {
-        const device = await devicesCollection.findOne({ _id: new ObjectId(deviceId) });
-        if (device?.qrToken) {
-          publishedOk = await publishOrderDispense(device.qrToken, {
-            orderId: result.insertedId.toString(),
-            items: newOrder.items.map((i) => ({ slotNumber: i.slotNumber, qty: i.qty })),
-          });
-        }
-      } catch (mqttErr) {
-        console.error("[mqtt] Error publishing order trigger:", mqttErr);
-      }
-
-      if (!publishedOk) {
-        console.warn(`[mqtt] Publish failed or unconfirmed for order ${result.insertedId} — reverting to pending for retry`);
-        await ordersCollection.updateOne(
-          { _id: result.insertedId },
-          { $set: { status: "pending", dispensingStartedAt: null } }
-        );
-        newOrder.status = "pending";
-        newOrder.dispensingStartedAt = null;
-      }
+    try {
+      await publishWake(device.qrToken);
+    } catch (mqttErr) {
+      console.error("[mqtt] Error publishing wake-up:", mqttErr);
     }
 
     res.status(201).json({ _id: result.insertedId, ...newOrder });
