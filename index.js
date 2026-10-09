@@ -521,14 +521,32 @@ app.delete("/api/devices/:id", requireAuth, requireRole(["owner", "admin"]), asy
     if (device.ownerId !== req.user.id && req.user.role !== "admin") {
       return res.status(403).json({ error: "Not your device" });
     }
-    const productCount = await productsCollection.countDocuments({ deviceId: device._id.toString() });
-    if (productCount > 0) {
-      return res.status(400).json({
-        error: `Can't delete — ${productCount} product(s) are still assigned to this device. Reassign or delete them first.`,
+    const deviceId = device._id.toString();
+
+    // Never pull a machine out from under an order that's still running.
+    const activeOrder = await ordersCollection.findOne(
+      { deviceId, status: { $in: ["pending", "dispensing"] } },
+      { projection: { _id: 1 } }
+    );
+    if (activeOrder) {
+      return res.status(409).json({ error: "This machine still has an order in progress. Try again once it finishes." });
+    }
+
+    // Its products go with it, but only when the caller explicitly
+    // confirms that (?deleteProducts=true, sent after the confirmation
+    // dialog listed them). Past orders are kept for history and revenue.
+    const productCount = await productsCollection.countDocuments({ deviceId });
+    if (productCount > 0 && req.query.deleteProducts !== "true") {
+      return res.status(409).json({
+        error: `${productCount} product(s) are assigned to this device. Confirm deleting them too.`,
+        code: "PRODUCTS_ASSIGNED",
+        productCount,
       });
     }
+
+    const { deletedCount: productsDeleted } = await productsCollection.deleteMany({ deviceId });
     await devicesCollection.deleteOne({ _id: device._id });
-    res.json({ success: true });
+    res.json({ success: true, productsDeleted });
   } catch (error) {
     console.error("Error deleting device:", error);
     res.status(500).json({ error: "Internal server error" });
