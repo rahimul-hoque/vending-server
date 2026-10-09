@@ -102,13 +102,18 @@ run().catch(console.dir);
 // telling them it had actually failed.
 const STALE_ORDER_MS = 90 * 1000;
 
-// Board polls every 5s; heartbeat writes are throttled to HEARTBEAT_WRITE_MS,
-// so "online" must tolerate that gap plus a few missed polls.
-const HEARTBEAT_WRITE_MS = 15 * 1000;
-const ONLINE_WINDOW_MS = 45 * 1000;
-const withOnline = (device) => ({
+// Board polls every 5s and each poll stamps lastSeen (HEARTBEAT_WRITE_MS
+// only stops back-to-back duplicate polls from writing twice). Offline =
+// no poll for ONLINE_WINDOW_MS: about two missed polls plus slack for a
+// slow serverless request. The board stops polling while it dispenses, so
+// a device with an active order counts as online too.
+const HEARTBEAT_WRITE_MS = 4 * 1000;
+const ONLINE_WINDOW_MS = 15 * 1000;
+const withOnline = (device, dispensingIds = new Set()) => ({
   ...device,
-  online: !!device.lastSeen && Date.now() - new Date(device.lastSeen).getTime() < ONLINE_WINDOW_MS,
+  online:
+    dispensingIds.has(device._id.toString()) ||
+    (!!device.lastSeen && Date.now() - new Date(device.lastSeen).getTime() < ONLINE_WINDOW_MS),
 });
 
 // Flips an order to "failed" and restores stock for whatever wasn't
@@ -355,7 +360,18 @@ app.get("/api/devices", requireAuth, requireRole(["owner", "admin"]), async (req
   try {
     const filter = req.user.role === "admin" ? {} : { ownerId: req.user.id };
     const devices = await devicesCollection.find(filter).toArray();
-    res.json(devices.map(withOnline));
+    const dispensing = await ordersCollection
+      .find(
+        {
+          deviceId: { $in: devices.map((d) => d._id.toString()) },
+          status: "dispensing",
+          dispensingStartedAt: { $gte: new Date(Date.now() - STALE_ORDER_MS) },
+        },
+        { projection: { deviceId: 1 } }
+      )
+      .toArray();
+    const dispensingIds = new Set(dispensing.map((o) => o.deviceId));
+    res.json(devices.map((d) => withOnline(d, dispensingIds)));
   } catch (error) {
     console.error("Error listing devices:", error);
     res.status(500).json({ error: "Internal server error" });
