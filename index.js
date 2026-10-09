@@ -1266,6 +1266,9 @@ app.get("/api/orders/stats", requireAuth, requireRole(["owner", "admin"]), async
   } catch (error) {
     console.error("Error computing order stats:", error);
     res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // (/api/orders/stats and /mine must stay above this route, or Express
 // matches "stats"/"mine" as an order id.)
 
@@ -1332,9 +1335,6 @@ app.get("/api/orders", requireAuth, requireRole(["owner", "admin"]), async (req,
   } catch (error) {
     console.error("Error listing all orders:", error);
     res.status(500).json({ error: "Internal server error" });
-  }
-});
-
   }
 });
 
