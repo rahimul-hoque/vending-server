@@ -759,20 +759,42 @@ app.get(
       const deviceIds = req.query.deviceId.split(",").map((id) => id.trim()).filter(Boolean);
       filter.deviceId = deviceIds.length > 1 ? { $in: deviceIds } : deviceIds[0];
     }
-    // Dashboards only need counts/prices/stock, never the photo — and the
-    // base64-encoded `image` field is by far the largest part of each
-    // product document, so this is what actually makes those pages slow.
-    const projection = req.query.noImages === "true" ? { image: 0 } : {};
-    const products = await productsCollection.find(filter, { projection }).toArray();
+    // Lists never carry the photo itself — it's a base64 blob that dwarfs
+    // the rest of the document. Clients get hasImage + imageVersion and load
+    // the picture from /api/products/:id/image, which the browser caches.
+    const products = await productsCollection
+      .aggregate([{ $match: filter }, ...WITHOUT_IMAGE])
+      .toArray();
     res.json(products);
   }
 );
+
+// The product photo as a real image response. imageVersion in the URL
+// changes whenever the photo does, so the browser can cache it forever.
+app.get("/api/products/:id/image", requireAuth, async (req, res) => {
+  try {
+    const product = await productsCollection.findOne(
+      { _id: new ObjectId(req.params.id) },
+      { projection: { image: 1 } }
+    );
+    const match = typeof product?.image === "string" && product.image.match(/^data:([^;,]+);base64,(.*)$/s);
+    if (!match) return res.status(404).json({ error: "No image" });
+    res.set("Content-Type", match[1]);
+    res.set("Cache-Control", "private, max-age=31536000, immutable");
+    res.send(Buffer.from(match[2], "base64"));
+  } catch (error) {
+    console.error("Error serving product image:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // Single product lookup — backs the customer-facing product detail page,
 // which itself sits behind a required session (src/proxy.js).
 app.get("/api/products/:id", requireAuth, async (req, res) => {
   try {
-    const product = await productsCollection.findOne({ _id: new ObjectId(req.params.id) });
+    const [product] = await productsCollection
+      .aggregate([{ $match: { _id: new ObjectId(req.params.id) } }, ...WITHOUT_IMAGE])
+      .toArray();
     if (!product) return res.status(404).json({ error: "Product not found" });
     res.json(product);
   } catch (error) {
@@ -780,6 +802,18 @@ app.get("/api/products/:id", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Replaces the base64 `image` field with hasImage + imageVersion (0 for
+// photos saved before versioning existed).
+const WITHOUT_IMAGE = [
+  {
+    $addFields: {
+      hasImage: { $and: [{ $eq: [{ $type: "$image" }, "string"] }, { $gt: [{ $strLenBytes: "$image" }, 0] }] },
+      imageVersion: { $ifNull: ["$imageVersion", 0] },
+    },
+  },
+  { $project: { image: 0 } },
+];
 
 // Shared by POST and PUT — a product's slot must be within the device's
 // real slot count, and no other product on that same device may already
@@ -859,6 +893,7 @@ app.post(
         price: parsedPrice, // Saved strictly as a Number for down-stream calculations
         stock: parsedStock, // Guaranteed to be a number (defaults to 0)
         image: image || null, // base64 data URL, or null if the owner skipped adding a photo
+        imageVersion: Date.now(),
         slotNumber: parsedSlotNumber, // Which physical slot in the machine dispenses this item
         deviceId: deviceId, // Which physical machine this item is stocked in
         ownerId: req.user.id, // Securely injected from authentication middleware
@@ -867,9 +902,11 @@ app.post(
 
       const result = await productsCollection.insertOne(newProduct);
 
+      const { image: _omit, ...withoutImage } = newProduct;
       return res.status(201).json({
         _id: result.insertedId,
-        ...newProduct,
+        ...withoutImage,
+        hasImage: !!newProduct.image,
       });
     } catch (error) {
       console.error("Error creating product:", error);
@@ -890,7 +927,27 @@ app.put(
         return res.status(403).json({ error: "Not your product" });
       }
 
-      const update = { ...req.body };
+      // Only these fields are editable — spreading req.body straight into
+      // $set would let a caller overwrite ownerId, createdAt, etc.
+      const update = {};
+      for (const key of ["name", "description", "price", "stock", "slotNumber", "deviceId"]) {
+        if (req.body[key] !== undefined) update[key] = req.body[key];
+      }
+      if (update.price !== undefined) update.price = Number(update.price);
+      if (update.stock !== undefined) update.stock = Number(update.stock);
+      if (update.deviceId !== undefined && update.deviceId !== product.deviceId) {
+        const target = await devicesCollection.findOne({ _id: new ObjectId(update.deviceId) });
+        if (!target) return res.status(400).json({ error: "Validation Error: device not found" });
+        if (target.ownerId !== req.user.id && req.user.role !== "admin") {
+          return res.status(403).json({ error: "You don't own that device" });
+        }
+      }
+      // `image` omitted = keep the current photo; a data URL replaces it;
+      // null removes it. Bumping imageVersion busts the browser cache.
+      if (req.body.image !== undefined) {
+        update.image = req.body.image || null;
+        update.imageVersion = Date.now();
+      }
       if (update.slotNumber !== undefined) {
         const parsedSlotNumber = Number(update.slotNumber);
         const targetDeviceId = update.deviceId || product.deviceId;
@@ -900,7 +957,11 @@ app.put(
       }
 
       await productsCollection.updateOne({ _id: product._id }, { $set: update });
-      res.json({ success: true });
+      res.json({
+        success: true,
+        hasImage: update.image !== undefined ? !!update.image : !!product.image,
+        imageVersion: update.imageVersion ?? product.imageVersion ?? 0,
+      });
     } catch (error) {
       console.error("Error updating product:", error);
       res.status(500).json({ error: "Internal server error" });
@@ -1120,23 +1181,110 @@ app.get("/api/orders/:id", requireAuth, async (req, res) => {
   }
 });
 
+// Orders an owner may see: those on their own devices. Admin sees all.
+async function orderScopeFilter(user) {
+  if (user.role === "admin") return {};
+  const ownDevices = await devicesCollection
+    .find({ ownerId: user.id }, { projection: { _id: 1 } })
+    .toArray();
+  return { deviceId: { $in: ownDevices.map((d) => d._id.toString()) } };
+}
+
 // Owner sees orders across their own devices; admin sees every order.
-// This is what powers the revenue/top-sellers charts AND /owner/orders.
+// Paginated newest-first: ?limit (default 20, max 100) and ?before=<order
+// _id> from the previous page's nextCursor. Optional ?status and ?deviceId
+// filters run server-side so pagination stays correct when filtering.
 app.get("/api/orders", requireAuth, requireRole(["owner", "admin"]), async (req, res) => {
   try {
-    let filter = {};
-    if (req.user.role !== "admin") {
-      const ownDevices = await devicesCollection
-        .find({ ownerId: req.user.id }, { projection: { _id: 1 } })
-        .toArray();
-      const deviceIds = ownDevices.map((d) => d._id.toString());
-      filter = { deviceId: { $in: deviceIds } };
+    const scope = await orderScopeFilter(req.user);
+    await expireStaleOrders(scope);
+
+    const filter = { ...scope };
+    if (["pending", "dispensing", "completed", "failed"].includes(req.query.status)) {
+      filter.status = req.query.status;
     }
-    await expireStaleOrders(filter);
-    const orders = await ordersCollection.find(filter).sort({ createdAt: -1 }).toArray();
-    res.json(orders);
+    if (req.query.deviceId) {
+      const allowed = !scope.deviceId || scope.deviceId.$in.includes(req.query.deviceId);
+      filter.deviceId = allowed ? req.query.deviceId : "__none__";
+    }
+    if (req.query.before && ObjectId.isValid(req.query.before)) {
+      filter._id = { $lt: new ObjectId(req.query.before) };
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+
+    const orders = await ordersCollection.find(filter).sort({ _id: -1 }).limit(limit + 1).toArray();
+    const hasMore = orders.length > limit;
+    const page = hasMore ? orders.slice(0, limit) : orders;
+    res.json({ orders: page, nextCursor: hasMore ? page[page.length - 1]._id.toString() : null });
   } catch (error) {
     console.error("Error listing all orders:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Dashboard numbers computed in the database instead of shipping every
+// order to the browser. Failed orders had their stock refunded, so they
+// don't count towards revenue or top sellers. ?tz (IANA name) sets which
+// calendar day an order falls on.
+app.get("/api/orders/stats", requireAuth, requireRole(["owner", "admin"]), async (req, res) => {
+  try {
+    const scope = await orderScopeFilter(req.user);
+    await expireStaleOrders(scope);
+
+    let timezone = "UTC";
+    try {
+      if (req.query.tz) {
+        new Intl.DateTimeFormat("en", { timeZone: req.query.tz });
+        timezone = req.query.tz;
+      }
+    } catch {} // unknown zone name: fall back to UTC
+
+    const [result] = await ordersCollection
+      .aggregate([
+        { $match: scope },
+        {
+          $facet: {
+            byStatus: [{ $group: { _id: "$status", count: { $sum: 1 } } }],
+            revenue: [
+              { $match: { status: { $ne: "failed" } } },
+              { $group: { _id: null, total: { $sum: "$total" } } },
+            ],
+            revenueByDay: [
+              { $match: { status: { $ne: "failed" } } },
+              {
+                $group: {
+                  _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone } },
+                  revenue: { $sum: "$total" },
+                },
+              },
+              { $sort: { _id: 1 } },
+              { $project: { _id: 0, day: "$_id", revenue: 1 } },
+            ],
+            topSelling: [
+              { $match: { status: { $ne: "failed" } } },
+              { $unwind: "$items" },
+              { $group: { _id: "$items.name", qty: { $sum: "$items.qty" } } },
+              { $sort: { qty: -1 } },
+              { $limit: 8 },
+              { $project: { _id: 0, name: "$_id", qty: 1 } },
+            ],
+          },
+        },
+      ])
+      .toArray();
+
+    const counts = { pending: 0, dispensing: 0, completed: 0, failed: 0 };
+    for (const { _id, count } of result.byStatus) if (_id in counts) counts[_id] = count;
+
+    res.json({
+      totalRevenue: result.revenue[0]?.total || 0,
+      orderCount: counts.pending + counts.dispensing + counts.completed + counts.failed,
+      counts,
+      revenueByDay: result.revenueByDay,
+      topSelling: result.topSelling,
+    });
+  } catch (error) {
+    console.error("Error computing order stats:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
