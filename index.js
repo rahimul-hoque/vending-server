@@ -1,4 +1,5 @@
-import express, { json } from "express";
+import express, { json, urlencoded } from "express";
+import { initSSLCommerzPayment, validateSSLCommerzPayment } from "./lib/sslcommerz.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import { randomUUID } from "crypto";
@@ -13,6 +14,7 @@ const app = express();
 const port = process.env.PORT;
 
 app.use(json({ limit: "5mb" })); // product photos arrive as base64 data URLs — default 100kb limit would reject real images
+app.use(urlencoded({ extended: true, limit: "5mb" })); // parses form POSTs from payment gateways
 app.use(cors());
 
 async function run() {
@@ -101,6 +103,7 @@ run().catch(console.dir);
 // staring at "dispensing your order" for up to 5 minutes with nothing
 // telling them it had actually failed.
 const STALE_ORDER_MS = 90 * 1000;
+const STALE_PAYMENT_MS = 15 * 60 * 1000; // 15 mins for customer to complete payment gateway checkout
 
 // Board polls every 5s and each poll stamps lastSeen (HEARTBEAT_WRITE_MS
 // only stops back-to-back duplicate polls from writing twice). Offline =
@@ -190,6 +193,7 @@ async function expireStaleOrders(extraFilter = {}) {
       $or: [
         { status: "pending", createdAt: { $lt: cutoff } },
         { status: "dispensing", dispensingStartedAt: { $lt: cutoff } },
+        { status: "payment_pending", createdAt: { $lt: new Date(Date.now() - STALE_PAYMENT_MS) } },
       ],
     })
     .toArray();
@@ -1164,15 +1168,19 @@ app.post("/api/orders", requireAuth, async (req, res) => {
       return res.status(validationError.status).json({ error: validationError.message });
     }
 
-    // Every order starts "pending"; the board claims it (-> "dispensing")
-    // through its own poll, so the status always reflects what the
-    // machine actually has. The wake-up below just makes that immediate.
+    const { paymentMethod } = req.body;
+    const isOnlinePayment = paymentMethod === "sslcommerz";
+
     const newOrder = {
       customerId: req.user.id,
       deviceId,
       items: orderItems,
       total,
-      status: "pending",
+      status: isOnlinePayment ? "payment_pending" : "pending",
+      payment: {
+        provider: paymentMethod || "test",
+        status: isOnlinePayment ? "PENDING" : "COMPLETED",
+      },
       createdAt: new Date(),
       dispensingStartedAt: null,
       completedAt: null,
@@ -1182,13 +1190,32 @@ app.post("/api/orders", requireAuth, async (req, res) => {
     };
     const result = await ordersCollection.insertOne(newOrder);
 
-    try {
-      await publishWake(device.qrToken);
-    } catch (mqttErr) {
-      console.error("[mqtt] Error publishing wake-up:", mqttErr);
+    let paymentUrl = null;
+    if (isOnlinePayment) {
+      try {
+        const customer = await userCollection.findOne({ _id: new ObjectId(req.user.id) });
+        const paymentInit = await initSSLCommerzPayment({
+          orderId: result.insertedId.toString(),
+          amount: total,
+          customerName: customer?.name || "Dispo Customer",
+          customerEmail: customer?.email || "customer@dispo.app",
+          customerPhone: customer?.phone || "01700000000",
+        });
+        paymentUrl = paymentInit.gatewayUrl;
+      } catch (paymentErr) {
+        console.error("[sslcommerz] Init error:", paymentErr);
+        await failOrderInternal({ ...newOrder, _id: result.insertedId }, "payment_init_failed");
+        return res.status(502).json({ error: "Failed to initialize payment gateway. Please try again." });
+      }
+    } else {
+      try {
+        await publishWake(device.qrToken);
+      } catch (mqttErr) {
+        console.error("[mqtt] Error publishing wake-up:", mqttErr);
+      }
     }
 
-    res.status(201).json({ _id: result.insertedId, ...newOrder });
+    res.status(201).json({ _id: result.insertedId, ...newOrder, paymentUrl });
   } catch (error) {
     console.error("Error creating order:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -1403,3 +1430,118 @@ if (!process.env.VERCEL) {
 }
 
 export default app;
+
+// ── SSLCOMMERZ Payment Callbacks ──────────────────────
+app.post("/api/payments/sslcommerz/success", async (req, res) => {
+  try {
+    const { tran_id, val_id, card_type, bank_tran_id } = req.body;
+    const clientUrl = process.env.CLIENT_URL || "https://dispo-client.vercel.app";
+
+    if (!tran_id || !val_id) {
+      return res.redirect(`${clientUrl}/shop/checkout?payment=failed&reason=missing_data`);
+    }
+
+    const validation = await validateSSLCommerzPayment(val_id);
+    if (!validation.isValid) {
+      console.warn(`[sslcommerz] Invalid transaction for val_id ${val_id}`);
+      return res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id}&payment=failed&reason=invalid_transaction`);
+    }
+
+    const order = await ordersCollection.findOne({ _id: new ObjectId(tran_id) });
+    if (!order) {
+      return res.redirect(`${clientUrl}/shop/checkout?payment=failed&reason=order_not_found`);
+    }
+
+    if (order.payment?.status !== "PAID") {
+      await ordersCollection.updateOne(
+        { _id: order._id },
+        {
+          $set: {
+            status: "pending",
+            "payment.status": "PAID",
+            "payment.val_id": val_id,
+            "payment.bank_tran_id": bank_tran_id || null,
+            "payment.card_type": card_type || null,
+            "payment.paidAt": new Date(),
+          },
+        }
+      );
+
+      const device = await devicesCollection.findOne({ _id: new ObjectId(order.deviceId) });
+      if (device) {
+        await dispatchNextPendingOrder(device);
+      }
+    }
+
+    res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id}&payment=success`);
+  } catch (error) {
+    console.error("[sslcommerz] Success callback error:", error);
+    const clientUrl = process.env.CLIENT_URL || "https://dispo-client.vercel.app";
+    res.redirect(`${clientUrl}/shop/checkout?payment=failed`);
+  }
+});
+
+app.post("/api/payments/sslcommerz/fail", async (req, res) => {
+  const { tran_id } = req.body;
+  const clientUrl = process.env.CLIENT_URL || "https://dispo-client.vercel.app";
+  try {
+    if (tran_id && ObjectId.isValid(tran_id)) {
+      const order = await ordersCollection.findOne({ _id: new ObjectId(tran_id) });
+      if (order && order.status === "payment_pending") {
+        await failOrderInternal(order, "payment_failed");
+      }
+    }
+  } catch (err) {
+    console.error("[sslcommerz] Fail handler error:", err);
+  }
+  res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id || ""}&payment=failed`);
+});
+
+app.post("/api/payments/sslcommerz/cancel", async (req, res) => {
+  const { tran_id } = req.body;
+  const clientUrl = process.env.CLIENT_URL || "https://dispo-client.vercel.app";
+  try {
+    if (tran_id && ObjectId.isValid(tran_id)) {
+      const order = await ordersCollection.findOne({ _id: new ObjectId(tran_id) });
+      if (order && order.status === "payment_pending") {
+        await failOrderInternal(order, "payment_cancelled");
+      }
+    }
+  } catch (err) {
+    console.error("[sslcommerz] Cancel handler error:", err);
+  }
+  res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id || ""}&payment=cancelled`);
+});
+
+app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
+  try {
+    const { tran_id, val_id } = req.body;
+    if (!tran_id || !val_id) return res.status(400).send("Missing parameters");
+
+    const validation = await validateSSLCommerzPayment(val_id);
+    if (!validation.isValid) return res.status(400).send("Invalid transaction");
+
+    const order = await ordersCollection.findOne({ _id: new ObjectId(tran_id) });
+    if (!order) return res.status(404).send("Order not found");
+
+    if (order.payment?.status !== "PAID") {
+      await ordersCollection.updateOne(
+        { _id: order._id },
+        {
+          $set: {
+            status: "pending",
+            "payment.status": "PAID",
+            "payment.val_id": val_id,
+            "payment.paidAt": new Date(),
+          },
+        }
+      );
+      const device = await devicesCollection.findOne({ _id: new ObjectId(order.deviceId) });
+      if (device) await dispatchNextPendingOrder(device);
+    }
+    res.status(200).send("IPN processed");
+  } catch (err) {
+    console.error("[sslcommerz] IPN error:", err);
+    res.status(500).send("Internal server error");
+  }
+});
