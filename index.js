@@ -1431,6 +1431,58 @@ if (!process.env.VERCEL) {
 
 export default app;
 
+function sendClientRedirect(res, targetUrl, message = "Redirecting to Dispo...") {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  return res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${message}</title>
+  <style>
+    body {
+      background-color: #F5F6F1;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      color: #1a1a1a;
+      text-align: center;
+      padding: 20px;
+    }
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid rgba(255, 93, 0, 0.2);
+      border-radius: 50%;
+      border-top-color: #FF5D00;
+      animation: spin 0.8s ease-in-out infinite;
+      margin-bottom: 16px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    p {
+      font-size: 16px;
+      font-weight: 500;
+      color: #4a4a4a;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="spinner"></div>
+  <p>${message}</p>
+  <script>
+    window.location.replace(${JSON.stringify(targetUrl)});
+  </script>
+</body>
+</html>`);
+}
+
 // ── SSLCOMMERZ Payment Callbacks ──────────────────────
 app.post("/api/payments/sslcommerz/success", async (req, res) => {
   try {
@@ -1438,18 +1490,18 @@ app.post("/api/payments/sslcommerz/success", async (req, res) => {
     const clientUrl = process.env.CLIENT_URL || "https://dispo-client.vercel.app";
 
     if (!tran_id || !val_id) {
-      return res.redirect(`${clientUrl}/shop/checkout?payment=failed&reason=missing_data`);
+      return sendClientRedirect(res, `${clientUrl}/shop/checkout?payment=failed&reason=missing_data`, "Returning to Dispo...");
     }
 
     const validation = await validateSSLCommerzPayment(val_id);
     if (!validation.isValid) {
       console.warn(`[sslcommerz] Invalid transaction for val_id ${val_id}`);
-      return res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id}&payment=failed&reason=invalid_transaction`);
+      return sendClientRedirect(res, `${clientUrl}/shop/checkout?orderId=${tran_id}&payment=failed&reason=invalid_transaction`, "Returning to Dispo...");
     }
 
     const order = await ordersCollection.findOne({ _id: new ObjectId(tran_id) });
     if (!order) {
-      return res.redirect(`${clientUrl}/shop/checkout?payment=failed&reason=order_not_found`);
+      return sendClientRedirect(res, `${clientUrl}/shop/checkout?payment=failed&reason=order_not_found`, "Returning to Dispo...");
     }
 
     if (order.payment?.status !== "PAID") {
@@ -1473,11 +1525,11 @@ app.post("/api/payments/sslcommerz/success", async (req, res) => {
       }
     }
 
-    res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id}&payment=success`);
+    return sendClientRedirect(res, `${clientUrl}/shop/checkout?orderId=${tran_id}&payment=success`, "Payment verified! Returning to Dispo...");
   } catch (error) {
     console.error("[sslcommerz] Success callback error:", error);
     const clientUrl = process.env.CLIENT_URL || "https://dispo-client.vercel.app";
-    res.redirect(`${clientUrl}/shop/checkout?payment=failed`);
+    return sendClientRedirect(res, `${clientUrl}/shop/checkout?payment=failed`, "Returning to Dispo...");
   }
 });
 
@@ -1494,7 +1546,7 @@ app.post("/api/payments/sslcommerz/fail", async (req, res) => {
   } catch (err) {
     console.error("[sslcommerz] Fail handler error:", err);
   }
-  res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id || ""}&payment=failed`);
+  return sendClientRedirect(res, `${clientUrl}/shop/checkout?orderId=${tran_id || ""}&payment=failed`, "Returning to Dispo...");
 });
 
 app.post("/api/payments/sslcommerz/cancel", async (req, res) => {
@@ -1510,7 +1562,7 @@ app.post("/api/payments/sslcommerz/cancel", async (req, res) => {
   } catch (err) {
     console.error("[sslcommerz] Cancel handler error:", err);
   }
-  res.redirect(`${clientUrl}/shop/checkout?orderId=${tran_id || ""}&payment=cancelled`);
+  return sendClientRedirect(res, `${clientUrl}/shop/checkout?orderId=${tran_id || ""}&payment=cancelled`, "Payment cancelled. Returning to Dispo...");
 });
 
 app.post("/api/payments/sslcommerz/ipn", async (req, res) => {
