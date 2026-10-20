@@ -112,7 +112,7 @@ const STALE_PAYMENT_MS = 15 * 60 * 1000; // 15 mins for customer to complete pay
 // stops polling while it dispenses, so a device with an active order
 // counts as online too.
 const HEARTBEAT_WRITE_MS = 4 * 1000;
-const ONLINE_WINDOW_MS = 20 * 1000;
+const ONLINE_WINDOW_MS = 60 * 1000;
 const withOnline = (device, dispensingIds = new Set()) => ({
   ...device,
   online:
